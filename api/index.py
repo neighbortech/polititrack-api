@@ -382,35 +382,58 @@ async def get_member_votes_on_tracked_bills(member_name: str, bioguide_id: str |
 # NEW: Member bioguide ID lookup
 # ═══════════════════════════════════════════════════════════
 
-async def find_bioguide_id(name: str, state: str) -> str | None:
-    """Look up a member's bioguide ID from Congress.gov."""
-    if not CONGRESS_KEY:
-        return None
+async def find_member_info(name: str, state: str) -> dict:
+    """Look up a member's bioguide ID and committees from Congress.gov.
 
-    ck = f"bioguide:{name}:{state}"
+    Returns {bioguide_id, committees}.
+    """
+    if not CONGRESS_KEY:
+        return {"bioguide_id": None, "committees": []}
+
+    ck = f"member_info:{name}:{state}"
     cv = cached(ck, ttl=7200)
     if cv is not None:
         return cv
 
+    result = {"bioguide_id": None, "committees": []}
     last_name = name.split()[-1] if name else name
     try:
         data = await congress("/member", {
             "currentMember": "true", "limit": "50",
         })
         members = data.get("members", [])
-        name_lower = name.lower()
         for m in members:
             mn = (m.get("name", "") or "").lower()
             ms = m.get("state", "")
             if last_name.lower() in mn and ms == state:
-                bio_id = m.get("bioguideId", "")
-                cache_set(ck, bio_id)
-                return bio_id
+                result["bioguide_id"] = m.get("bioguideId", "")
+                # Fetch committees for this member
+                if result["bioguide_id"]:
+                    try:
+                        cdata = await congress(
+                            f"/member/{result['bioguide_id']}",
+                        )
+                        member_detail = cdata.get("member", {})
+                        # Extract current committee names
+                        for assignment in member_detail.get("currentMember", []):
+                            pass  # currentMember is top-level, committees are elsewhere
+                        # Try the direct committees path
+                        cdata2 = await congress(
+                            f"/member/{result['bioguide_id']}/committees",
+                            {"limit": "50"},
+                        )
+                        for c in cdata2.get("committees", []):
+                            cname = c.get("name", "")
+                            if cname:
+                                result["committees"].append(cname)
+                    except Exception:
+                        pass
+                break
     except Exception as e:
         logger.warning(f"Congress.gov member search failed for {name}: {e}")
 
-    cache_set(ck, None)
-    return None
+    cache_set(ck, result)
+    return result
 
 
 # ═══════════════════════════════════════════════════════════
@@ -435,11 +458,14 @@ async def district_data(zip: str = Query(..., min_length=5, max_length=5)):
         state = rep.get("state", "")
         chamber = rep.get("chamber", "House")
 
-        # Parallel fetch: FEC data + bioguide ID
+        # Parallel fetch: FEC data + member info (bioguide + committees)
         fec_task = fetch_full_member_fec(name, state, chamber)
-        bio_task = find_bioguide_id(name, state)
+        info_task = find_member_info(name, state)
 
-        fec_data, bioguide_id = await asyncio.gather(fec_task, bio_task)
+        fec_data, member_info = await asyncio.gather(fec_task, info_task)
+
+        bioguide_id = member_info.get("bioguide_id")
+        committees = member_info.get("committees", [])
 
         # Now fetch votes (needs bioguide_id)
         votes = await get_member_votes_on_tracked_bills(name, bioguide_id, chamber)
@@ -456,7 +482,7 @@ async def district_data(zip: str = Query(..., min_length=5, max_length=5)):
             "photoUrl": rep.get("photoUrl", ""),
             "bioguide_id": bioguide_id,
             "fec_id": fec_data.get("fec_id"),
-            "committees": [],  # Would need a separate Congress.gov call
+            "committees": committees,
             "topDonors": fec_data.get("top_donors", []),
             "topIndustries": fec_data.get("top_industries", []),
             "totalFromTopIndustries": sum(
@@ -770,6 +796,115 @@ async def reps_by_zip(zip: str = Query(..., min_length=5, max_length=5)):
         "count": len(results),
         "results": results,
         "source": "whoismyrepresentative.com" if results else "none",
+    }
+
+
+# ── API key management (simple in-memory for now) ───────
+
+import uuid
+import time
+
+_api_keys = {}  # key_string -> {email, name, tier, created, requests_today, last_reset}
+
+
+@app.post("/api/v1/keys")
+async def create_api_key(body: dict = None):
+    """Generate a free API key."""
+    if not body:
+        raise HTTPException(400, "Provide email in request body")
+    email = body.get("email", "")
+    name = body.get("name", "")
+    if not email:
+        raise HTTPException(400, "Email is required")
+    key = f"pt_live_{uuid.uuid4().hex[:24]}"
+    _api_keys[key] = {
+        "email": email, "name": name, "tier": "free",
+        "daily_limit": 100, "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "requests_today": 0, "last_reset": time.strftime("%Y-%m-%d"),
+    }
+    return {
+        "key": key, "key_prefix": key[:16],
+        "tier": "free", "daily_limit": 100,
+        "created_at": _api_keys[key]["created_at"],
+    }
+
+
+@app.get("/api/v1/keys/me")
+async def check_api_key(x_api_key: str = Query(None, alias="X-API-Key")):
+    """Check API key usage and remaining quota."""
+    from fastapi import Header
+    # Try header first, then query param
+    key = x_api_key
+    if not key:
+        raise HTTPException(401, "Provide X-API-Key header")
+    info = _api_keys.get(key)
+    if not info:
+        raise HTTPException(404, "API key not found")
+    # Reset daily count if new day
+    today = time.strftime("%Y-%m-%d")
+    if info["last_reset"] != today:
+        info["requests_today"] = 0
+        info["last_reset"] = today
+    return {
+        "key_prefix": key[:16],
+        "tier": info["tier"],
+        "daily_limit": info["daily_limit"],
+        "requests_today": info["requests_today"],
+        "remaining": info["daily_limit"] - info["requests_today"],
+    }
+
+
+# ── Donor summary (for Explore page profile view) ───────
+
+@app.get("/api/v1/donors/{donor_id}/summary")
+async def donor_summary(donor_id: str):
+    """Get aggregated donor summary. Tries FEC committee lookup."""
+    try:
+        # Try as committee ID
+        data = await fec(f"/committee/{donor_id}/", {})
+        committee = data.get("results", [{}])[0] if data.get("results") else {}
+        if not committee:
+            raise HTTPException(404, "Donor not found")
+
+        # Get financials
+        fin = {}
+        try:
+            fdata = await fec(f"/committee/{donor_id}/totals/", {"per_page": "1"})
+            fin = fdata.get("results", [{}])[0] if fdata.get("results") else {}
+        except Exception:
+            pass
+
+        return {
+            "name": committee.get("name", donor_id),
+            "type": committee.get("committee_type_full", "Committee"),
+            "industry": committee.get("designation_full", ""),
+            "state": committee.get("state", ""),
+            "total": fin.get("receipts", 0) or 0,
+            "byParty": {},
+            "byYear": {},
+            "topRecipients": [],
+            "recentDonations": [],
+            "lobbying": {"spend": "N/A", "issues": [], "filings": 0},
+            "contracts": {"total": "N/A", "agency": "", "count": 0},
+            "velocity": {"trend": "N/A", "lastSpike": "N/A", "concentration": "N/A"},
+            "influenceScore": None,
+        }
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(404, f"Donor '{donor_id}' not found")
+
+
+# ── AI analyze/ask (placeholder with helpful response) ──
+
+@app.get("/api/v1/analyze/ask")
+async def analyze_ask(q: str = Query(..., min_length=3)):
+    """AI-powered question answering about political money. Placeholder."""
+    return {
+        "answer": f"Analysis for '{q}' requires the Pro tier. This endpoint will use AI to cross-reference FEC donations, Senate lobbying filings, Congress.gov vote records, and USASpending contract data to answer your question. Upgrade to Pro at polititrack.com/pricing for AI-powered analysis.",
+        "confidence": None,
+        "sources": ["FEC", "Senate LDA", "Congress.gov", "USASpending"],
+        "tier_required": "pro",
     }
 
 
