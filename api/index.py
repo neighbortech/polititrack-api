@@ -8,8 +8,10 @@ import os
 import asyncio
 import logging
 import re
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, Header, Body, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional
 import httpx
 
 logging.basicConfig(level=logging.INFO)
@@ -20,7 +22,7 @@ app = FastAPI(title="PolitiTrack API", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -33,14 +35,15 @@ CONGRESS_BASE = "https://api.congress.gov/v3"
 # ── Simple in-memory cache (survives within a single Lambda warm period) ──
 
 _cache = {}
+_CACHE_MISS = object()  # sentinel to distinguish "not cached" from "cached as None"
 
 def cached(key, ttl=600):
-    """Simple cache check. Returns cached value or None."""
+    """Simple cache check. Returns _CACHE_MISS if not cached, otherwise the cached value (which may be None)."""
     import time
     entry = _cache.get(key)
     if entry and time.time() - entry["t"] < ttl:
         return entry["v"]
-    return None
+    return _CACHE_MISS
 
 def cache_set(key, value):
     import time
@@ -53,6 +56,16 @@ def cache_set(key, value):
 
 
 # ── FEC API helper ──────────────────────────────────────
+
+def safe_float(val, default=0.0):
+    """Safely convert to float. Handles None, empty string, and non-numeric values."""
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
 
 async def fec(endpoint: str, params: dict) -> dict:
     params["api_key"] = FEC_KEY
@@ -130,7 +143,7 @@ async def find_fec_candidate(name: str, state: str, office: str = "H") -> str | 
     """Find FEC candidate_id by name and state. Returns candidate_id or None."""
     ck = f"fec_cand:{name}:{state}:{office}"
     cv = cached(ck, ttl=3600)
-    if cv is not None:
+    if cv is not _CACHE_MISS:
         return cv
 
     # Search by last name for better matching
@@ -166,7 +179,7 @@ async def get_candidate_committee(candidate_id: str) -> str | None:
     """Get the principal campaign committee for a candidate."""
     ck = f"fec_comm:{candidate_id}"
     cv = cached(ck, ttl=3600)
-    if cv is not None:
+    if cv is not _CACHE_MISS:
         return cv
 
     try:
@@ -192,7 +205,7 @@ async def get_member_donors(candidate_id: str, committee_id: str | None) -> dict
     """
     ck = f"fec_donors:{candidate_id}"
     cv = cached(ck, ttl=1800)
-    if cv is not None:
+    if cv is not _CACHE_MISS:
         return cv
 
     result = {"top_donors": [], "top_industries": [], "total_raised": 0}
@@ -277,7 +290,7 @@ async def get_bill_roll_calls(bill_type: str, bill_number: int, congress_num: in
     """Get roll call vote URLs for a bill from Congress.gov actions."""
     ck = f"bill_rc:{bill_type}{bill_number}"
     cv = cached(ck, ttl=3600)
-    if cv is not None:
+    if cv is not _CACHE_MISS:
         return cv
 
     if not CONGRESS_KEY:
@@ -313,7 +326,7 @@ async def parse_roll_call_xml(url: str) -> dict:
     """Fetch and parse a House/Senate roll call XML, returning {bioguide_id: vote_position}."""
     ck = f"rc_xml:{url}"
     cv = cached(ck, ttl=3600)
-    if cv is not None:
+    if cv is not _CACHE_MISS:
         return cv
 
     result = {}
@@ -392,32 +405,25 @@ async def find_member_info(name: str, state: str) -> dict:
 
     ck = f"member_info:{name}:{state}"
     cv = cached(ck, ttl=7200)
-    if cv is not None:
+    if cv is not _CACHE_MISS:
         return cv
 
     result = {"bioguide_id": None, "committees": []}
     last_name = name.split()[-1] if name else name
+
+    # We need to search all current members — Congress.gov paginates at 250 max
+    # First try filtering by state to reduce results
     try:
         data = await congress("/member", {
-            "currentMember": "true", "limit": "50",
+            "currentMember": "true", "limit": "250", "stateCode": state,
         })
         members = data.get("members", [])
         for m in members:
             mn = (m.get("name", "") or "").lower()
-            ms = m.get("state", "")
-            if last_name.lower() in mn and ms == state:
+            if last_name.lower() in mn:
                 result["bioguide_id"] = m.get("bioguideId", "")
-                # Fetch committees for this member
                 if result["bioguide_id"]:
                     try:
-                        cdata = await congress(
-                            f"/member/{result['bioguide_id']}",
-                        )
-                        member_detail = cdata.get("member", {})
-                        # Extract current committee names
-                        for assignment in member_detail.get("currentMember", []):
-                            pass  # currentMember is top-level, committees are elsewhere
-                        # Try the direct committees path
                         cdata2 = await congress(
                             f"/member/{result['bioguide_id']}/committees",
                             {"limit": "50"},
@@ -636,7 +642,7 @@ async def search_people(
                 "occupation": r.get("contributor_occupation", ""),
                 "city": r.get("contributor_city", ""),
                 "state": r.get("contributor_state", ""),
-                "amount": float(r.get("contribution_receipt_amount", 0)),
+                "amount": safe_float(r.get("contribution_receipt_amount")),
                 "date": r.get("contribution_receipt_date", ""),
                 "recipient": r.get("candidate_name") or r.get("committee", {}).get("name", "Unknown"),
                 "recipient_party": (r.get("candidate") or {}).get("party"),
@@ -668,10 +674,10 @@ async def person_profile(name: str, cycles: str = Query("2024,2022,2020")):
     if not all_c:
         raise HTTPException(404, f"No contributions found for '{name}'")
 
-    total = sum(float(c.get("contribution_receipt_amount", 0)) for c in all_c)
+    total = sum(safe_float(c.get("contribution_receipt_amount")) for c in all_c)
     by_recip, by_party, by_cycle = {}, {}, {}
     for c in all_c:
-        amt = float(c.get("contribution_receipt_amount", 0))
+        amt = safe_float(c.get("contribution_receipt_amount"))
         cand = c.get("candidate_name") or c.get("committee", {}).get("name", "Unknown")
         party = (c.get("candidate") or {}).get("party") or "Other"
         cy = str(c.get("two_year_transaction_period", "?"))
@@ -692,7 +698,7 @@ async def person_profile(name: str, cycles: str = Query("2024,2022,2020")):
         "by_cycle": {k: round(v, 2) for k, v in by_cycle.items()},
         "recipients": sorted([{**v, "total": round(v["total"], 2)} for v in by_recip.values()], key=lambda x: -x["total"])[:30],
         "recent_contributions": [
-            {"recipient": c.get("candidate_name") or c.get("committee", {}).get("name", "?"), "amount": float(c.get("contribution_receipt_amount", 0)), "date": c.get("contribution_receipt_date", ""), "party": (c.get("candidate") or {}).get("party"), "committee": c.get("committee", {}).get("name", "")}
+            {"recipient": c.get("candidate_name") or c.get("committee", {}).get("name", "?"), "amount": safe_float(c.get("contribution_receipt_amount")), "date": c.get("contribution_receipt_date", ""), "party": (c.get("candidate") or {}).get("party"), "committee": c.get("committee", {}).get("name", "")}
             for c in sorted(all_c, key=lambda x: x.get("contribution_receipt_date", ""), reverse=True)[:50]
         ],
     }
@@ -711,7 +717,7 @@ async def search_donors(q: str = Query(..., min_length=2), limit: int = Query(10
             name = r.get("contributor_name", "Unknown")
             if name not in grouped:
                 grouped[name] = {"id": None, "name": name, "type": "individual", "industry": r.get("contributor_occupation"), "state": r.get("contributor_state"), "employer": r.get("contributor_employer"), "total_contributed": 0}
-            grouped[name]["total_contributed"] += float(r.get("contribution_receipt_amount", 0))
+            grouped[name]["total_contributed"] += safe_float(r.get("contribution_receipt_amount"))
     except:
         pass
     committees = []
@@ -745,7 +751,7 @@ async def search_donations(
             {
                 "donor": {"name": r.get("contributor_name", ""), "industry": r.get("contributor_occupation", ""), "state": r.get("contributor_state", "")},
                 "recipient": {"name": r.get("candidate_name") or r.get("committee", {}).get("name", ""), "party": (r.get("candidate") or {}).get("party")},
-                "amount": float(r.get("contribution_receipt_amount", 0)),
+                "amount": safe_float(r.get("contribution_receipt_amount")),
                 "date": r.get("contribution_receipt_date", ""),
             }
             for r in data.get("results", [])
@@ -826,10 +832,14 @@ _api_keys = {}  # key_string -> {email, name, tier, created, requests_today, las
 
 
 @app.post("/api/v1/keys")
-async def create_api_key(body: dict = None):
+async def create_api_key(request: Request):
     """Generate a free API key."""
-    if not body:
-        raise HTTPException(400, "Provide email in request body")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Provide JSON body with email field")
+    if not body or not isinstance(body, dict):
+        raise HTTPException(400, "Provide JSON body with email field")
     email = body.get("email", "")
     name = body.get("name", "")
     if not email:
@@ -848,23 +858,19 @@ async def create_api_key(body: dict = None):
 
 
 @app.get("/api/v1/keys/me")
-async def check_api_key(x_api_key: str = Query(None, alias="X-API-Key")):
+async def check_api_key(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
     """Check API key usage and remaining quota."""
-    from fastapi import Header
-    # Try header first, then query param
-    key = x_api_key
-    if not key:
+    if not x_api_key:
         raise HTTPException(401, "Provide X-API-Key header")
-    info = _api_keys.get(key)
+    info = _api_keys.get(x_api_key)
     if not info:
         raise HTTPException(404, "API key not found")
-    # Reset daily count if new day
     today = time.strftime("%Y-%m-%d")
     if info["last_reset"] != today:
         info["requests_today"] = 0
         info["last_reset"] = today
     return {
-        "key_prefix": key[:16],
+        "key_prefix": x_api_key[:16],
         "tier": info["tier"],
         "daily_limit": info["daily_limit"],
         "requests_today": info["requests_today"],
@@ -929,7 +935,10 @@ async def analyze_ask(q: str = Query(..., min_length=3)):
 # ── ZIP → state mapping ─────────────────────────────────
 
 def zip_to_state(z: str) -> str:
-    n = int(z[:3])
+    try:
+        n = int(z[:3])
+    except (ValueError, TypeError):
+        return ""
     mapping = [
         (10, 27, "MA"), (28, 29, "RI"), (30, 38, "NH"), (39, 49, "ME"),
         (50, 59, "VT"), (60, 69, "CT"), (70, 89, "NJ"), (100, 149, "NY"),
