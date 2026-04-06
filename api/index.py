@@ -139,37 +139,64 @@ TRACKED_BILLS = [
 # NEW: Per-member FEC data lookups
 # ═══════════════════════════════════════════════════════════
 
+def _clean_rep_name(name: str) -> str:
+    """Remove titles and suffixes from representative names."""
+    if not name:
+        return name
+    # Remove common prefixes
+    for prefix in ["Rep. ", "Sen. ", "Representative ", "Senator ", "Del. ", "Delegate ", "Commish. "]:
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+    # Remove suffixes like Jr., Sr., III, IV
+    name = re.sub(r',?\s+(Jr\.?|Sr\.?|III|IV|II)\s*$', '', name)
+    return name.strip()
+
+
 async def find_fec_candidate(name: str, state: str, office: str = "H") -> str | None:
     """Find FEC candidate_id by name and state. Returns candidate_id or None."""
-    ck = f"fec_cand:{name}:{state}:{office}"
+    clean_name = _clean_rep_name(name)
+    ck = f"fec_cand:{clean_name}:{state}:{office}"
     cv = cached(ck, ttl=3600)
     if cv is not _CACHE_MISS:
         return cv
 
-    # Search by last name for better matching
-    last_name = name.split()[-1] if name else name
-    try:
-        data = await fec("/candidates/search/", {
-            "q": last_name, "state": state, "office": office,
-            "sort": "-election_year", "per_page": "10",
-            "is_active_candidate": "true",
-        })
-        results = data.get("results", [])
-        # Try to match on full name
-        name_lower = name.lower()
-        for r in results:
-            cand_name = r.get("name", "").lower()
-            if last_name.lower() in cand_name:
-                cid = r.get("candidate_id")
-                cache_set(ck, cid)
-                return cid
-        # Fallback: first result
-        if results:
-            cid = results[0].get("candidate_id")
-            cache_set(ck, cid)
-            return cid
-    except Exception as e:
-        logger.warning(f"FEC candidate search failed for {name}: {e}")
+    last_name = clean_name.split()[-1] if clean_name else clean_name
+    first_name = clean_name.split()[0].lower() if clean_name and " " in clean_name else ""
+
+    # Try the specified office first, then try the other office as fallback
+    # (handles cases like Adam Schiff who moved from House to Senate)
+    offices_to_try = [office]
+    alt_office = "H" if office == "S" else "S"
+    offices_to_try.append(alt_office)
+
+    for off in offices_to_try:
+        try:
+            data = await fec("/candidates/search/", {
+                "q": last_name, "state": state, "office": off,
+                "sort": "-election_year", "per_page": "20",
+            })
+            results = data.get("results", [])
+
+            # FEC stores names as "SCHIFF, ADAM B." — match on last name + first name
+            for r in results:
+                cand_name = (r.get("name", "") or "").upper()
+                if last_name.upper() in cand_name:
+                    # If we have a first name, verify it matches too
+                    if first_name and first_name.upper() not in cand_name:
+                        continue
+                    cid = r.get("candidate_id")
+                    cache_set(ck, cid)
+                    return cid
+
+            # Fallback: any result with matching last name
+            for r in results:
+                cand_name = (r.get("name", "") or "").upper()
+                if last_name.upper() in cand_name:
+                    cid = r.get("candidate_id")
+                    cache_set(ck, cid)
+                    return cid
+        except Exception as e:
+            logger.warning(f"FEC candidate search failed for {clean_name} ({state}, {off}): {e}")
 
     cache_set(ck, None)
     return None
@@ -409,7 +436,9 @@ async def find_member_info(name: str, state: str) -> dict:
         return cv
 
     result = {"bioguide_id": None, "committees": []}
-    last_name = name.split()[-1] if name else name
+    clean_name = _clean_rep_name(name)
+    last_name = clean_name.split()[-1] if clean_name else clean_name
+    first_name = clean_name.split()[0].lower() if clean_name and " " in clean_name else ""
 
     # We need to search all current members — Congress.gov paginates at 250 max
     # First try filtering by state to reduce results
@@ -420,7 +449,8 @@ async def find_member_info(name: str, state: str) -> dict:
         members = data.get("members", [])
         for m in members:
             mn = (m.get("name", "") or "").lower()
-            if last_name.lower() in mn:
+            # Congress.gov returns names as "Schiff, Adam" or "Adam Schiff"
+            if last_name.lower() in mn and (not first_name or first_name in mn):
                 result["bioguide_id"] = m.get("bioguideId", "")
                 if result["bioguide_id"]:
                     try:
