@@ -756,9 +756,27 @@ async def search_donations(
 @app.get("/api/v1/stats/overview")
 async def stats():
     return {
-        "platform": "PolitiTrack", "version": "2.0.0", "data_sources": 5,
-        "sources": ["FEC", "Senate LDA", "Congress.gov", "ProPublica Congress", "USASpending"],
-        "note": "Use /api/v1/district?zip=XXXXX for full district data with real FEC + Congress.gov data",
+        "platform": "PolitiTrack", "version": "2.0.0",
+        "data_sources_live": ["FEC (api.open.fec.gov)", "Congress.gov (api.congress.gov)"],
+        "data_sources_planned": ["Senate LDA", "USASpending"],
+        "features_live": [
+            "ZIP → representative lookup",
+            "Per-member FEC donation data (top donors, top industries, total raised)",
+            "Per-member committee assignments",
+            "Per-member voting records on 5 tracked FY2026 bills",
+            "Individual donor search and profiles",
+            "PAC/committee search",
+            "MCP server for AI assistants",
+        ],
+        "features_planned": [
+            "Historical FEC filing snapshots",
+            "Influence scoring",
+            "Vote-alignment analysis",
+            "Cross-source connection discovery",
+            "Amendment tracking",
+        ],
+        "tracked_bills": ["H.R. 7148", "H.R. 7147", "H.R. 3944", "H.R. 7006", "S. 890"],
+        "note": "Use /api/v1/district?zip=XXXXX for full district data",
     }
 
 
