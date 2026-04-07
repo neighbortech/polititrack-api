@@ -48,9 +48,9 @@ def cached(key, ttl=600):
 def cache_set(key, value):
     import time
     _cache[key] = {"v": value, "t": time.time()}
-    # Evict if cache gets too big (serverless memory)
-    if len(_cache) > 500:
-        oldest = sorted(_cache.keys(), key=lambda k: _cache[k]["t"])[:100]
+    # Evict if cache gets too big (serverless memory — Vercel gives 1024MB)
+    if len(_cache) > 2000:
+        oldest = sorted(_cache.keys(), key=lambda k: _cache[k]["t"])[:500]
         for k in oldest:
             del _cache[k]
 
@@ -590,7 +590,14 @@ async def district_data(zip: str = Query(..., min_length=5, max_length=5)):
 
     Returns real representatives with real FEC donor data and real voting records.
     This is the endpoint the My District page should call.
+    Results are cached for 2 hours — subsequent requests for the same ZIP are instant.
     """
+    # Check district-level cache first (caches the ENTIRE response)
+    district_ck = f"district_full:{zip}"
+    district_cv = cached(district_ck, ttl=7200)  # 2 hour cache
+    if district_cv is not _CACHE_MISS:
+        return district_cv
+
     # Step 1: Get representatives (reuse existing logic)
     reps_raw = await _get_reps_raw(zip)
     if not reps_raw:
@@ -601,14 +608,28 @@ async def district_data(zip: str = Query(..., min_length=5, max_length=5)):
         name = rep.get("name", "")
         state = rep.get("state", "")
         chamber = rep.get("chamber", "House")
+        # Congress.gov primary source already provides bioguide_id
+        pre_bioguide = rep.get("bioguide_id", "")
 
-        # Parallel fetch: FEC data + member info (bioguide + committees)
+        # Parallel fetch: FEC data + member info (committees, and bioguide if not already known)
         fec_task = fetch_full_member_fec(name, state, chamber)
-        info_task = find_member_info(name, state)
+        if pre_bioguide:
+            # Already have bioguide from Congress.gov — just fetch committees
+            async def _get_committees():
+                try:
+                    cdata = await congress(f"/member/{pre_bioguide}/committees", {"limit": "50"})
+                    return {"bioguide_id": pre_bioguide, "committees": [
+                        c.get("name", "") for c in cdata.get("committees", []) if c.get("name")
+                    ]}
+                except Exception:
+                    return {"bioguide_id": pre_bioguide, "committees": []}
+            info_task = _get_committees()
+        else:
+            info_task = find_member_info(name, state)
 
         fec_data, member_info = await asyncio.gather(fec_task, info_task)
 
-        bioguide_id = member_info.get("bioguide_id")
+        bioguide_id = member_info.get("bioguide_id") or pre_bioguide
         committees = member_info.get("committees", [])
 
         # Now fetch votes (needs bioguide_id)
@@ -642,7 +663,7 @@ async def district_data(zip: str = Query(..., min_length=5, max_length=5)):
     enriched = await asyncio.gather(*[enrich_rep(r) for r in reps_raw])
 
     state = reps_raw[0].get("state", "") if reps_raw else ""
-    return {
+    response = {
         "zip": zip,
         "state": state,
         "representatives": list(enriched),
@@ -656,68 +677,79 @@ async def district_data(zip: str = Query(..., min_length=5, max_length=5)):
             for b in TRACKED_BILLS
         ],
         "source": "fec.gov + congress.gov",
+        "cached": False,
     }
+
+    # Cache the full district response for 2 hours
+    cache_set(district_ck, response)
+    return response
 
 
 async def _get_reps_raw(zip: str) -> list:
-    """Get raw rep list from whoismyrepresentative or congress.gov."""
+    """Get raw rep list — Congress.gov first (authoritative, filters deceased/resigned),
+    whoismyrepresentative.com as fallback (better district-level granularity)."""
     results = []
+    state = zip_to_state(zip)
 
-    # Try whoismyrepresentative.com first
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(
-                f"https://whoismyrepresentative.com/getall_mems.php?zip={zip}&output=json"
-            )
-            if r.status_code == 200:
-                data = r.json()
-                for m in data.get("results", []):
-                    is_senator = "senate" in (m.get("link", "") or "").lower()
-                    results.append({
-                        "name": m.get("name", "Unknown"),
-                        "party": m.get("party", ""),
-                        "state": m.get("state", ""),
-                        "district": m.get("district", ""),
-                        "chamber": "Senate" if is_senator else "House",
-                        "phone": m.get("phone", ""),
-                        "office": m.get("office", ""),
-                        "website": m.get("link", ""),
-                    })
-    except Exception:
-        pass
-
-    # Fallback: Congress.gov
-    if not results and CONGRESS_KEY:
+    # PRIMARY: Congress.gov — only returns currentMember=true (no deceased/resigned)
+    if CONGRESS_KEY and state:
         try:
-            state = zip_to_state(zip)
-            if state:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    r = await client.get(
-                        f"https://api.congress.gov/v3/member",
-                        params={
-                            "stateCode": state, "currentMember": "true",
-                            "limit": 20, "api_key": CONGRESS_KEY, "format": "json",
-                        },
-                    )
-                    if r.status_code == 200:
-                        data = r.json()
-                        for m in data.get("members", []):
-                            terms = m.get("terms", {}).get("item", [])
-                            latest = terms[-1] if terms else {}
-                            ch = latest.get("chamber", "")
-                            results.append({
-                                "name": m.get("name", ""),
-                                "party": m.get("partyName", ""),
-                                "state": m.get("state", ""),
-                                "district": str(m.get("district", "")),
-                                "chamber": ch if ch in ("Senate", "House") else (
-                                    "Senate" if "Senate" in ch else "House"
-                                ),
-                                "phone": "(202) 224-3121",
-                                "office": "",
-                                "website": m.get("officialWebsiteUrl", ""),
-                                "photoUrl": (m.get("depiction") or {}).get("imageUrl", ""),
-                            })
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get(
+                    "https://api.congress.gov/v3/member",
+                    params={
+                        "stateCode": state, "currentMember": "true",
+                        "limit": "50", "api_key": CONGRESS_KEY, "format": "json",
+                    },
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    for m in data.get("members", []):
+                        terms = m.get("terms", {}).get("item", [])
+                        latest = terms[-1] if terms else {}
+                        ch = latest.get("chamber", "")
+                        chamber = "Senate" if "Senate" in ch else "House"
+                        # Congress.gov returns names as "Last, First" — normalize to "First Last"
+                        raw_name = m.get("name", "")
+                        if "," in raw_name:
+                            parts = raw_name.split(",", 1)
+                            raw_name = f"{parts[1].strip()} {parts[0].strip()}"
+                        results.append({
+                            "name": raw_name,
+                            "party": m.get("partyName", ""),
+                            "state": m.get("state", state),
+                            "district": str(m.get("district", "")),
+                            "chamber": chamber,
+                            "phone": "(202) 224-3121",
+                            "office": "",
+                            "website": m.get("officialWebsiteUrl", ""),
+                            "photoUrl": (m.get("depiction") or {}).get("imageUrl", ""),
+                            "bioguide_id": m.get("bioguideId", ""),
+                        })
+        except Exception as e:
+            logger.warning(f"Congress.gov member lookup failed: {_sanitize_error(e)}")
+
+    # FALLBACK: whoismyrepresentative.com — if Congress.gov returned nothing
+    if not results:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get(
+                    f"https://whoismyrepresentative.com/getall_mems.php?zip={zip}&output=json"
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    for m in data.get("results", []):
+                        is_senator = "senate" in (m.get("link", "") or "").lower()
+                        results.append({
+                            "name": m.get("name", "Unknown"),
+                            "party": m.get("party", ""),
+                            "state": m.get("state", ""),
+                            "district": m.get("district", ""),
+                            "chamber": "Senate" if is_senator else "House",
+                            "phone": m.get("phone", ""),
+                            "office": m.get("office", ""),
+                            "website": m.get("link", ""),
+                        })
         except Exception:
             pass
 
@@ -735,11 +767,14 @@ async def root():
 
 @app.get("/health")
 async def health():
+    district_keys = [k for k in _cache if k.startswith("district_full:")]
     return {
         "status": "healthy",
         "fec_key_set": bool(FEC_KEY),
         "congress_key_set": bool(CONGRESS_KEY),
         "cache_size": len(_cache),
+        "cached_districts": len(district_keys),
+        "cached_zips": [k.split(":")[1] for k in district_keys][:20],
     }
 
 
