@@ -686,72 +686,57 @@ async def district_data(zip: str = Query(..., min_length=5, max_length=5)):
 
 
 async def _get_reps_raw(zip: str) -> list:
-    """Get raw rep list — Congress.gov first (authoritative, filters deceased/resigned),
-    whoismyrepresentative.com as fallback (better district-level granularity)."""
+    """Get representatives from Congress.gov (authoritative, current members only).
+
+    Uses currentMember=true which automatically filters out deceased, resigned,
+    and former members. whoismyrepresentative.com was removed because it showed
+    Dianne Feinstein (died 2023) and Kamala Harris (left 2021) as late as 2026.
+    """
     results = []
     state = zip_to_state(zip)
 
-    # PRIMARY: Congress.gov — only returns currentMember=true (no deceased/resigned)
-    if CONGRESS_KEY and state:
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                r = await client.get(
-                    "https://api.congress.gov/v3/member",
-                    params={
-                        "stateCode": state, "currentMember": "true",
-                        "limit": "50", "api_key": CONGRESS_KEY, "format": "json",
-                    },
-                )
-                if r.status_code == 200:
-                    data = r.json()
-                    for m in data.get("members", []):
-                        terms = m.get("terms", {}).get("item", [])
-                        latest = terms[-1] if terms else {}
-                        ch = latest.get("chamber", "")
-                        chamber = "Senate" if "Senate" in ch else "House"
-                        # Congress.gov returns names as "Last, First" — normalize to "First Last"
-                        raw_name = m.get("name", "")
-                        if "," in raw_name:
-                            parts = raw_name.split(",", 1)
-                            raw_name = f"{parts[1].strip()} {parts[0].strip()}"
-                        results.append({
-                            "name": raw_name,
-                            "party": m.get("partyName", ""),
-                            "state": m.get("state", state),
-                            "district": str(m.get("district", "")),
-                            "chamber": chamber,
-                            "phone": "(202) 224-3121",
-                            "office": "",
-                            "website": m.get("officialWebsiteUrl", ""),
-                            "photoUrl": (m.get("depiction") or {}).get("imageUrl", ""),
-                            "bioguide_id": m.get("bioguideId", ""),
-                        })
-        except Exception as e:
-            logger.warning(f"Congress.gov member lookup failed: {_sanitize_error(e)}")
+    if not state:
+        return results
 
-    # FALLBACK: whoismyrepresentative.com — if Congress.gov returned nothing
-    if not results:
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                r = await client.get(
-                    f"https://whoismyrepresentative.com/getall_mems.php?zip={zip}&output=json"
-                )
-                if r.status_code == 200:
-                    data = r.json()
-                    for m in data.get("results", []):
-                        is_senator = "senate" in (m.get("link", "") or "").lower()
-                        results.append({
-                            "name": m.get("name", "Unknown"),
-                            "party": m.get("party", ""),
-                            "state": m.get("state", ""),
-                            "district": m.get("district", ""),
-                            "chamber": "Senate" if is_senator else "House",
-                            "phone": m.get("phone", ""),
-                            "office": m.get("office", ""),
-                            "website": m.get("link", ""),
-                        })
-        except Exception:
-            pass
+    if not CONGRESS_KEY:
+        logger.warning("CONGRESS_API_KEY not set — cannot look up representatives")
+        return results
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(
+                "https://api.congress.gov/v3/member",
+                params={
+                    "stateCode": state, "currentMember": "true",
+                    "limit": "50", "api_key": CONGRESS_KEY, "format": "json",
+                },
+            )
+            if r.status_code == 200:
+                data = r.json()
+                for m in data.get("members", []):
+                    terms = m.get("terms", {}).get("item", [])
+                    latest = terms[-1] if terms else {}
+                    ch = latest.get("chamber", "")
+                    chamber = "Senate" if "Senate" in ch else "House"
+                    # Congress.gov returns names as "Last, First" — normalize
+                    raw_name = m.get("name", "")
+                    if "," in raw_name:
+                        parts = raw_name.split(",", 1)
+                        raw_name = f"{parts[1].strip()} {parts[0].strip()}"
+                    results.append({
+                        "name": raw_name,
+                        "party": m.get("partyName", ""),
+                        "state": m.get("state", state),
+                        "district": str(m.get("district", "")),
+                        "chamber": chamber,
+                        "phone": "(202) 224-3121",
+                        "office": "",
+                        "website": m.get("officialWebsiteUrl", ""),
+                        "photoUrl": (m.get("depiction") or {}).get("imageUrl", ""),
+                        "bioguide_id": m.get("bioguideId", ""),
+                    })
+    except Exception as e:
+        logger.warning(f"Congress.gov member lookup failed: {_sanitize_error(e)}")
 
     return results
 
@@ -997,7 +982,7 @@ async def reps_by_zip(zip: str = Query(..., min_length=5, max_length=5)):
         "zip": zip,
         "count": len(results),
         "results": results,
-        "source": "whoismyrepresentative.com" if results else "none",
+        "source": "congress.gov" if results else "none",
     }
 
 
