@@ -359,30 +359,42 @@ async def get_bill_roll_calls(bill_type: str, bill_number: int, congress_num: in
     if cv is not _CACHE_MISS:
         return cv
 
-    # Try Congress.gov API first
+    # Try Congress.gov API first — paginate through all actions
     if CONGRESS_KEY:
         try:
-            data = await congress(
-                f"/bill/{congress_num}/{bill_type}/{bill_number}/actions",
-                {"limit": "250"},
-            )
-            actions = data.get("actions", [])
             roll_calls = []
-            for action in actions:
-                rvs = action.get("recordedVotes", [])
-                for rv in rvs:
-                    url = rv.get("url", "")
-                    if url:
-                        roll_calls.append({
-                            "url": url,
-                            "date": action.get("actionDate", ""),
-                            "text": action.get("text", ""),
-                        })
+            offset = 0
+            while True:
+                data = await congress(
+                    f"/bill/{congress_num}/{bill_type}/{bill_number}/actions",
+                    {"limit": "250", "offset": str(offset)},
+                )
+                actions = data.get("actions", [])
+                if not actions:
+                    break
+                for action in actions:
+                    rvs = action.get("recordedVotes", [])
+                    for rv in rvs:
+                        url = rv.get("url", "")
+                        if url:
+                            roll_calls.append({
+                                "url": url,
+                                "date": rv.get("date", action.get("actionDate", "")),
+                                "text": action.get("text", ""),
+                            })
+                # If we got fewer than 250, we've reached the end
+                if len(actions) < 250:
+                    break
+                offset += 250
+            
             if roll_calls:
+                logger.info(f"Found {len(roll_calls)} roll call(s) for {bill_type}{bill_number} via Congress.gov API")
                 cache_set(ck, roll_calls)
                 return roll_calls
+            else:
+                logger.info(f"No recordedVotes found in Congress.gov actions for {bill_type}{bill_number}, using fallback")
         except Exception as e:
-            logger.warning(f"Congress.gov actions failed: {_sanitize_error(e)}")
+            logger.warning(f"Congress.gov actions failed for {bill_type}{bill_number}: {_sanitize_error(e)}")
 
     # Fallback: use hardcoded known roll call URLs
     fallback = KNOWN_ROLL_CALLS.get(bill_key, [])
@@ -391,7 +403,12 @@ async def get_bill_roll_calls(bill_type: str, bill_number: int, congress_num: in
 
 
 async def parse_roll_call_xml(url: str) -> dict:
-    """Fetch and parse a House/Senate roll call XML, returning {bioguide_id: vote_position}."""
+    """Fetch and parse a House/Senate roll call XML.
+    
+    Returns dict with two types of keys:
+    - bioguide_id -> vote_position (for House XML)
+    - "name:LASTNAME:STATE" -> vote_position (for Senate XML, since Senate doesn't use bioguide_id)
+    """
     ck = f"rc_xml:{url}"
     cv = cached(ck, ttl=3600)
     if cv is not _CACHE_MISS:
@@ -404,20 +421,25 @@ async def parse_roll_call_xml(url: str) -> dict:
             resp.raise_for_status()
             text = resp.text
 
-        # House XML: name-id="B001234" ... <vote>Yea</vote>
+        # House XML: <legislator name-id="B001234" ...>Name</legislator><vote>Yea</vote>
         house_pattern = re.compile(
             r'name-id="([A-Z]\d+)"[^>]*>.*?<vote>(\w+)</vote>', re.DOTALL
         )
         for match in house_pattern.finditer(text):
             result[match.group(1)] = match.group(2)
 
-        # Senate XML: <member><bioguide_id>X000000</bioguide_id>...<vote_cast>Yea</vote_cast>
+        # Senate XML: uses <last_name>, <state>, <vote_cast> — no bioguide_id!
         if not result:
             senate_pattern = re.compile(
-                r'<bioguide_id>(\w+)</bioguide_id>.*?<vote_cast>(\w+)</vote_cast>', re.DOTALL
+                r'<last_name>([^<]+)</last_name>\s*<first_name>[^<]*</first_name>\s*<party>[^<]*</party>\s*<state>([^<]+)</state>\s*<vote_cast>([^<]+)</vote_cast>',
+                re.DOTALL
             )
             for match in senate_pattern.finditer(text):
-                result[match.group(1)] = match.group(2)
+                last_name = match.group(1).strip()
+                state = match.group(2).strip()
+                vote = match.group(3).strip()
+                # Store with a name-based key since Senate doesn't have bioguide_id
+                result[f"name:{last_name.upper()}:{state}"] = vote
 
     except Exception as e:
         logger.warning(f"Roll call XML fetch failed: {_sanitize_error(e)}")
@@ -426,14 +448,20 @@ async def parse_roll_call_xml(url: str) -> dict:
     return result
 
 
-async def get_member_votes_on_tracked_bills(member_name: str, bioguide_id: str | None, chamber: str) -> list:
+async def get_member_votes_on_tracked_bills(member_name: str, bioguide_id: str | None, chamber: str, state: str = "") -> list:
     """Get a member's votes on all tracked bills.
 
     Returns list of {bill, title, vote, amount, yourCost, costDir}.
     Pre-fetches all roll call data in parallel to avoid serial HTTP calls.
+    Matches by bioguide_id for House and by last_name:state for Senate.
     """
-    if not bioguide_id:
-        # No bioguide = can't look up votes, return all "Not recorded"
+    # Build name-based key for Senate matching
+    clean_name = _clean_rep_name(member_name)
+    last_name = clean_name.split()[-1].upper() if clean_name else ""
+    senate_key = f"name:{last_name}:{state}" if last_name and state else ""
+
+    # If we have neither bioguide_id nor a usable name, skip
+    if not bioguide_id and not senate_key:
         return [
             {
                 "bill": f"{'H.R.' if bill['bill_type'] == 'hr' else 'S.'} {bill['number']}",
@@ -472,8 +500,13 @@ async def get_member_votes_on_tracked_bills(member_name: str, bioguide_id: str |
         vote_position = None
         for rc in all_roll_calls[i]:
             vote_map = url_to_votes.get(rc["url"], {})
-            if bioguide_id in vote_map:
+            # Try bioguide_id first (House XML)
+            if bioguide_id and bioguide_id in vote_map:
                 vote_position = vote_map[bioguide_id]
+                break
+            # Try name-based key (Senate XML)
+            if senate_key and senate_key in vote_map:
+                vote_position = vote_map[senate_key]
                 break
 
         votes.append({
@@ -579,7 +612,7 @@ async def district_data(zip: str = Query(..., min_length=5, max_length=5)):
         committees = member_info.get("committees", [])
 
         # Now fetch votes (needs bioguide_id)
-        votes = await get_member_votes_on_tracked_bills(name, bioguide_id, chamber)
+        votes = await get_member_votes_on_tracked_bills(name, bioguide_id, chamber, state)
 
         return {
             "name": name,
