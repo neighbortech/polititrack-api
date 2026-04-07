@@ -165,6 +165,8 @@ def _clean_rep_name(name: str) -> str:
 async def find_fec_candidate(name: str, state: str, office: str = "H") -> str | None:
     """Find FEC candidate_id by name and state. Returns candidate_id or None."""
     clean_name = _clean_rep_name(name)
+    if not clean_name or not clean_name.strip():
+        return None
     ck = f"fec_cand:{clean_name}:{state}:{office}"
     cv = cached(ck, ttl=3600)
     if cv is not _CACHE_MISS:
@@ -470,7 +472,11 @@ async def find_member_info(name: str, state: str) -> dict:
     if not CONGRESS_KEY:
         return {"bioguide_id": None, "committees": []}
 
-    ck = f"member_info:{name}:{state}"
+    clean_name = _clean_rep_name(name)
+    if not clean_name:
+        return {"bioguide_id": None, "committees": []}
+
+    ck = f"member_info:{clean_name}:{state}"
     cv = cached(ck, ttl=7200)
     if cv is not _CACHE_MISS:
         return cv
