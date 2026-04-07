@@ -67,6 +67,16 @@ def safe_float(val, default=0.0):
         return default
 
 
+def _sanitize_error(e: Exception) -> str:
+    """Remove API keys from exception strings."""
+    msg = str(e)
+    if FEC_KEY:
+        msg = msg.replace(FEC_KEY, "[REDACTED]")
+    if CONGRESS_KEY:
+        msg = msg.replace(CONGRESS_KEY, "[REDACTED]")
+    return msg
+
+
 async def fec(endpoint: str, params: dict) -> dict:
     params["api_key"] = FEC_KEY
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -142,7 +152,7 @@ TRACKED_BILLS = [
 def _clean_rep_name(name: str) -> str:
     """Remove titles and suffixes from representative names."""
     if not name:
-        return name
+        return ""
     # Remove common prefixes
     for prefix in ["Rep. ", "Sen. ", "Representative ", "Senator ", "Del. ", "Delegate ", "Commish. "]:
         if name.startswith(prefix):
@@ -196,7 +206,7 @@ async def find_fec_candidate(name: str, state: str, office: str = "H") -> str | 
                     cache_set(ck, cid)
                     return cid
         except Exception as e:
-            logger.warning(f"FEC candidate search failed for {clean_name} ({state}, {off}): {e}")
+            logger.warning(f"FEC candidate search failed for {clean_name} ({state}, {off}): {_sanitize_error(e)}")
 
     cache_set(ck, None)
     return None
@@ -219,7 +229,7 @@ async def get_candidate_committee(candidate_id: str) -> str | None:
             cache_set(ck, cid)
             return cid
     except Exception as e:
-        logger.warning(f"FEC committee lookup failed for {candidate_id}: {e}")
+        logger.warning(f"FEC committee lookup failed for {candidate_id}: {_sanitize_error(e)}")
 
     cache_set(ck, None)
     return None
@@ -267,7 +277,7 @@ async def get_member_donors(candidate_id: str, committee_id: str | None) -> dict
                 "industry": r.get("contributor_type", "Individual"),
             })
     except Exception as e:
-        logger.warning(f"FEC contributor lookup failed: {e}")
+        logger.warning(f"FEC contributor lookup failed: {_sanitize_error(e)}")
 
     # Get top industries (by employer as proxy)
     try:
@@ -290,7 +300,7 @@ async def get_member_donors(candidate_id: str, committee_id: str | None) -> dict
             if len(result["top_industries"]) >= 5:
                 break
     except Exception as e:
-        logger.warning(f"FEC industry lookup failed: {e}")
+        logger.warning(f"FEC industry lookup failed: {_sanitize_error(e)}")
 
     cache_set(ck, result)
     return result
@@ -344,7 +354,7 @@ async def get_bill_roll_calls(bill_type: str, bill_number: int, congress_num: in
         cache_set(ck, roll_calls)
         return roll_calls
     except Exception as e:
-        logger.warning(f"Congress.gov actions failed for {bill_type}{bill_number}: {e}")
+        logger.warning(f"Congress.gov actions failed: {_sanitize_error(e)}")
         cache_set(ck, [])
         return []
 
@@ -379,7 +389,7 @@ async def parse_roll_call_xml(url: str) -> dict:
                 result[match.group(1)] = match.group(2)
 
     except Exception as e:
-        logger.warning(f"Roll call XML fetch failed for {url}: {e}")
+        logger.warning(f"Roll call XML fetch failed: {_sanitize_error(e)}")
 
     cache_set(ck, result)
     return result
@@ -389,21 +399,51 @@ async def get_member_votes_on_tracked_bills(member_name: str, bioguide_id: str |
     """Get a member's votes on all tracked bills.
 
     Returns list of {bill, title, vote, amount, yourCost, costDir}.
+    Pre-fetches all roll call data in parallel to avoid serial HTTP calls.
     """
+    if not bioguide_id:
+        # No bioguide = can't look up votes, return all "Not recorded"
+        return [
+            {
+                "bill": f"{'H.R.' if bill['bill_type'] == 'hr' else 'S.'} {bill['number']}",
+                "title": bill["short_title"],
+                "vote": "Not recorded",
+                "amount": bill["amount"],
+                "yourCost": bill["yourCost_default"],
+                "costDir": bill["costDir"],
+                "status": bill["status"],
+            }
+            for bill in TRACKED_BILLS
+        ]
+
+    # Step 1: Fetch all bill roll calls in parallel
+    roll_call_tasks = [
+        get_bill_roll_calls(bill["bill_type"], bill["number"])
+        for bill in TRACKED_BILLS
+    ]
+    all_roll_calls = await asyncio.gather(*roll_call_tasks)
+
+    # Step 2: Collect all unique roll call URLs to fetch
+    url_set = set()
+    for rcs in all_roll_calls:
+        for rc in rcs:
+            url_set.add(rc["url"])
+
+    # Step 3: Fetch all roll call XMLs in parallel
+    url_list = list(url_set)
+    xml_tasks = [parse_roll_call_xml(url) for url in url_list]
+    xml_results = await asyncio.gather(*xml_tasks)
+    url_to_votes = dict(zip(url_list, xml_results))
+
+    # Step 4: Look up member's position in each bill
     votes = []
-
-    for bill in TRACKED_BILLS:
-        # Only check bills for the right chamber (House bills for House members, etc.)
-        # But appropriations bills get votes in both chambers
+    for i, bill in enumerate(TRACKED_BILLS):
         vote_position = None
-
-        if bioguide_id:
-            roll_calls = await get_bill_roll_calls(bill["bill_type"], bill["number"])
-            for rc in roll_calls:
-                vote_map = await parse_roll_call_xml(rc["url"])
-                if bioguide_id in vote_map:
-                    vote_position = vote_map[bioguide_id]
-                    break
+        for rc in all_roll_calls[i]:
+            vote_map = url_to_votes.get(rc["url"], {})
+            if bioguide_id in vote_map:
+                vote_position = vote_map[bioguide_id]
+                break
 
         votes.append({
             "bill": f"{'H.R.' if bill['bill_type'] == 'hr' else 'S.'} {bill['number']}",
@@ -466,7 +506,7 @@ async def find_member_info(name: str, state: str) -> dict:
                         pass
                 break
     except Exception as e:
-        logger.warning(f"Congress.gov member search failed for {name}: {e}")
+        logger.warning(f"Congress.gov member search failed: {_sanitize_error(e)}")
 
     cache_set(ck, result)
     return result
@@ -661,7 +701,7 @@ async def search_people(
     try:
         data = await fec("/schedules/schedule_a/", params)
     except Exception as e:
-        raise HTTPException(502, f"FEC API error: {e}")
+        raise HTTPException(502, f"FEC API error: {_sanitize_error(e)}")
 
     return {
         "total": data.get("pagination", {}).get("count", 0),
@@ -689,7 +729,12 @@ async def search_people(
 
 @app.get("/api/v1/people/{name}/profile")
 async def person_profile(name: str, cycles: str = Query("2024,2022,2020")):
-    cycle_list = [int(c.strip()) for c in cycles.split(",")]
+    try:
+        cycle_list = [int(c.strip()) for c in cycles.split(",") if c.strip().isdigit()]
+    except (ValueError, TypeError):
+        cycle_list = [2024, 2022, 2020]
+    if not cycle_list:
+        cycle_list = [2024, 2022, 2020]
     all_c = []
     for cyc in cycle_list:
         try:
@@ -699,7 +744,7 @@ async def person_profile(name: str, cycles: str = Query("2024,2022,2020")):
                 "sort": "-contribution_receipt_amount", "sort_hide_null": "true",
             })
             all_c.extend(data.get("results", []))
-        except:
+        except Exception:
             continue
     if not all_c:
         raise HTTPException(404, f"No contributions found for '{name}'")
@@ -748,14 +793,14 @@ async def search_donors(q: str = Query(..., min_length=2), limit: int = Query(10
             if name not in grouped:
                 grouped[name] = {"id": None, "name": name, "type": "individual", "industry": r.get("contributor_occupation"), "state": r.get("contributor_state"), "employer": r.get("contributor_employer"), "total_contributed": 0}
             grouped[name]["total_contributed"] += safe_float(r.get("contribution_receipt_amount"))
-    except:
+    except Exception:
         pass
     committees = []
     try:
         data = await fec("/names/committees/", {"q": q})
         for r in data.get("results", [])[:5]:
             committees.append({"id": r.get("id"), "name": r.get("name", ""), "type": "committee", "industry": None, "state": None, "total_contributed": 0})
-    except:
+    except Exception:
         pass
     return sorted(grouped.values(), key=lambda x: -x["total_contributed"])[:limit] + committees[:3]
 
@@ -774,7 +819,7 @@ async def search_donations(
     try:
         data = await fec("/schedules/schedule_a/", params)
     except Exception as e:
-        raise HTTPException(502, f"FEC API error: {e}")
+        raise HTTPException(502, f"FEC API error: {_sanitize_error(e)}")
     return {
         "total": data.get("pagination", {}).get("count", 0),
         "donations": [
