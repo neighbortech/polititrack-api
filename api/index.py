@@ -685,6 +685,62 @@ async def district_data(zip: str = Query(..., min_length=5, max_length=5)):
     return response
 
 
+# ── Static senator fallback (updated April 7, 2026 from senate.gov) ──
+# Used when Congress.gov API is down or unavailable
+STATIC_SENATORS = {
+    "AK": [{"name": "Lisa Murkowski", "party": "Republican", "state": "AK", "chamber": "Senate"}, {"name": "Dan Sullivan", "party": "Republican", "state": "AK", "chamber": "Senate"}],
+    "AL": [{"name": "Katie Boyd Britt", "party": "Republican", "state": "AL", "chamber": "Senate"}, {"name": "Tommy Tuberville", "party": "Republican", "state": "AL", "chamber": "Senate"}],
+    "AR": [{"name": "John Boozman", "party": "Republican", "state": "AR", "chamber": "Senate"}, {"name": "Tom Cotton", "party": "Republican", "state": "AR", "chamber": "Senate"}],
+    "AZ": [{"name": "Ruben Gallego", "party": "Democratic", "state": "AZ", "chamber": "Senate"}, {"name": "Mark Kelly", "party": "Democratic", "state": "AZ", "chamber": "Senate"}],
+    "CA": [{"name": "Alex Padilla", "party": "Democratic", "state": "CA", "chamber": "Senate"}, {"name": "Adam Schiff", "party": "Democratic", "state": "CA", "chamber": "Senate"}],
+    "CO": [{"name": "Michael Bennet", "party": "Democratic", "state": "CO", "chamber": "Senate"}, {"name": "John Hickenlooper", "party": "Democratic", "state": "CO", "chamber": "Senate"}],
+    "CT": [{"name": "Richard Blumenthal", "party": "Democratic", "state": "CT", "chamber": "Senate"}, {"name": "Christopher Murphy", "party": "Democratic", "state": "CT", "chamber": "Senate"}],
+    "DE": [{"name": "Lisa Blunt Rochester", "party": "Democratic", "state": "DE", "chamber": "Senate"}, {"name": "Christopher Coons", "party": "Democratic", "state": "DE", "chamber": "Senate"}],
+    "FL": [{"name": "Ashley Moody", "party": "Republican", "state": "FL", "chamber": "Senate"}, {"name": "Rick Scott", "party": "Republican", "state": "FL", "chamber": "Senate"}],
+    "GA": [{"name": "Jon Ossoff", "party": "Democratic", "state": "GA", "chamber": "Senate"}, {"name": "Raphael Warnock", "party": "Democratic", "state": "GA", "chamber": "Senate"}],
+    "HI": [{"name": "Mazie Hirono", "party": "Democratic", "state": "HI", "chamber": "Senate"}, {"name": "Brian Schatz", "party": "Democratic", "state": "HI", "chamber": "Senate"}],
+    "IA": [{"name": "Joni Ernst", "party": "Republican", "state": "IA", "chamber": "Senate"}, {"name": "Chuck Grassley", "party": "Republican", "state": "IA", "chamber": "Senate"}],
+    "ID": [{"name": "Mike Crapo", "party": "Republican", "state": "ID", "chamber": "Senate"}, {"name": "James Risch", "party": "Republican", "state": "ID", "chamber": "Senate"}],
+    "IL": [{"name": "Tammy Duckworth", "party": "Democratic", "state": "IL", "chamber": "Senate"}, {"name": "Dick Durbin", "party": "Democratic", "state": "IL", "chamber": "Senate"}],
+    "IN": [{"name": "Jim Banks", "party": "Republican", "state": "IN", "chamber": "Senate"}, {"name": "Todd Young", "party": "Republican", "state": "IN", "chamber": "Senate"}],
+    "KS": [{"name": "Roger Marshall", "party": "Republican", "state": "KS", "chamber": "Senate"}, {"name": "Jerry Moran", "party": "Republican", "state": "KS", "chamber": "Senate"}],
+    "KY": [{"name": "Mitch McConnell", "party": "Republican", "state": "KY", "chamber": "Senate"}, {"name": "Rand Paul", "party": "Republican", "state": "KY", "chamber": "Senate"}],
+    "LA": [{"name": "Bill Cassidy", "party": "Republican", "state": "LA", "chamber": "Senate"}, {"name": "John Kennedy", "party": "Republican", "state": "LA", "chamber": "Senate"}],
+    "MA": [{"name": "Ed Markey", "party": "Democratic", "state": "MA", "chamber": "Senate"}, {"name": "Elizabeth Warren", "party": "Democratic", "state": "MA", "chamber": "Senate"}],
+    "MD": [{"name": "Angela Alsobrooks", "party": "Democratic", "state": "MD", "chamber": "Senate"}, {"name": "Chris Van Hollen", "party": "Democratic", "state": "MD", "chamber": "Senate"}],
+    "ME": [{"name": "Susan Collins", "party": "Republican", "state": "ME", "chamber": "Senate"}, {"name": "Angus King", "party": "Independent", "state": "ME", "chamber": "Senate"}],
+    "MI": [{"name": "Gary Peters", "party": "Democratic", "state": "MI", "chamber": "Senate"}, {"name": "Elissa Slotkin", "party": "Democratic", "state": "MI", "chamber": "Senate"}],
+    "MN": [{"name": "Amy Klobuchar", "party": "Democratic", "state": "MN", "chamber": "Senate"}, {"name": "Tina Smith", "party": "Democratic", "state": "MN", "chamber": "Senate"}],
+    "MO": [{"name": "Josh Hawley", "party": "Republican", "state": "MO", "chamber": "Senate"}, {"name": "Eric Schmitt", "party": "Republican", "state": "MO", "chamber": "Senate"}],
+    "MS": [{"name": "Cindy Hyde-Smith", "party": "Republican", "state": "MS", "chamber": "Senate"}, {"name": "Roger Wicker", "party": "Republican", "state": "MS", "chamber": "Senate"}],
+    "MT": [{"name": "Steve Daines", "party": "Republican", "state": "MT", "chamber": "Senate"}, {"name": "Tim Sheehy", "party": "Republican", "state": "MT", "chamber": "Senate"}],
+    "NC": [{"name": "Ted Budd", "party": "Republican", "state": "NC", "chamber": "Senate"}, {"name": "Thom Tillis", "party": "Republican", "state": "NC", "chamber": "Senate"}],
+    "ND": [{"name": "Kevin Cramer", "party": "Republican", "state": "ND", "chamber": "Senate"}, {"name": "John Hoeven", "party": "Republican", "state": "ND", "chamber": "Senate"}],
+    "NE": [{"name": "Deb Fischer", "party": "Republican", "state": "NE", "chamber": "Senate"}, {"name": "Pete Ricketts", "party": "Republican", "state": "NE", "chamber": "Senate"}],
+    "NH": [{"name": "Maggie Hassan", "party": "Democratic", "state": "NH", "chamber": "Senate"}, {"name": "Jeanne Shaheen", "party": "Democratic", "state": "NH", "chamber": "Senate"}],
+    "NJ": [{"name": "Cory Booker", "party": "Democratic", "state": "NJ", "chamber": "Senate"}, {"name": "Andy Kim", "party": "Democratic", "state": "NJ", "chamber": "Senate"}],
+    "NM": [{"name": "Martin Heinrich", "party": "Democratic", "state": "NM", "chamber": "Senate"}, {"name": "Ben Ray Lujan", "party": "Democratic", "state": "NM", "chamber": "Senate"}],
+    "NV": [{"name": "Catherine Cortez Masto", "party": "Democratic", "state": "NV", "chamber": "Senate"}, {"name": "Jacky Rosen", "party": "Democratic", "state": "NV", "chamber": "Senate"}],
+    "NY": [{"name": "Kirsten Gillibrand", "party": "Democratic", "state": "NY", "chamber": "Senate"}, {"name": "Chuck Schumer", "party": "Democratic", "state": "NY", "chamber": "Senate"}],
+    "OH": [{"name": "Jon Husted", "party": "Republican", "state": "OH", "chamber": "Senate"}, {"name": "Bernie Moreno", "party": "Republican", "state": "OH", "chamber": "Senate"}],
+    "OK": [{"name": "James Lankford", "party": "Republican", "state": "OK", "chamber": "Senate"}, {"name": "Alan Armstrong", "party": "Republican", "state": "OK", "chamber": "Senate"}],
+    "OR": [{"name": "Jeff Merkley", "party": "Democratic", "state": "OR", "chamber": "Senate"}, {"name": "Ron Wyden", "party": "Democratic", "state": "OR", "chamber": "Senate"}],
+    "PA": [{"name": "John Fetterman", "party": "Democratic", "state": "PA", "chamber": "Senate"}, {"name": "Dave McCormick", "party": "Republican", "state": "PA", "chamber": "Senate"}],
+    "RI": [{"name": "Jack Reed", "party": "Democratic", "state": "RI", "chamber": "Senate"}, {"name": "Sheldon Whitehouse", "party": "Democratic", "state": "RI", "chamber": "Senate"}],
+    "SC": [{"name": "Lindsey Graham", "party": "Republican", "state": "SC", "chamber": "Senate"}, {"name": "Tim Scott", "party": "Republican", "state": "SC", "chamber": "Senate"}],
+    "SD": [{"name": "Mike Rounds", "party": "Republican", "state": "SD", "chamber": "Senate"}, {"name": "John Thune", "party": "Republican", "state": "SD", "chamber": "Senate"}],
+    "TN": [{"name": "Marsha Blackburn", "party": "Republican", "state": "TN", "chamber": "Senate"}, {"name": "Bill Hagerty", "party": "Republican", "state": "TN", "chamber": "Senate"}],
+    "TX": [{"name": "John Cornyn", "party": "Republican", "state": "TX", "chamber": "Senate"}, {"name": "Ted Cruz", "party": "Republican", "state": "TX", "chamber": "Senate"}],
+    "UT": [{"name": "John Curtis", "party": "Republican", "state": "UT", "chamber": "Senate"}, {"name": "Mike Lee", "party": "Republican", "state": "UT", "chamber": "Senate"}],
+    "VA": [{"name": "Tim Kaine", "party": "Democratic", "state": "VA", "chamber": "Senate"}, {"name": "Mark Warner", "party": "Democratic", "state": "VA", "chamber": "Senate"}],
+    "VT": [{"name": "Bernie Sanders", "party": "Independent", "state": "VT", "chamber": "Senate"}, {"name": "Peter Welch", "party": "Democratic", "state": "VT", "chamber": "Senate"}],
+    "WA": [{"name": "Maria Cantwell", "party": "Democratic", "state": "WA", "chamber": "Senate"}, {"name": "Patty Murray", "party": "Democratic", "state": "WA", "chamber": "Senate"}],
+    "WI": [{"name": "Tammy Baldwin", "party": "Democratic", "state": "WI", "chamber": "Senate"}, {"name": "Ron Johnson", "party": "Republican", "state": "WI", "chamber": "Senate"}],
+    "WV": [{"name": "Shelley Moore Capito", "party": "Republican", "state": "WV", "chamber": "Senate"}, {"name": "Jim Justice", "party": "Republican", "state": "WV", "chamber": "Senate"}],
+    "WY": [{"name": "John Barrasso", "party": "Republican", "state": "WY", "chamber": "Senate"}, {"name": "Cynthia Lummis", "party": "Republican", "state": "WY", "chamber": "Senate"}],
+}
+
+
 async def _get_reps_raw(zip: str) -> list:
     """Get representatives from Congress.gov (authoritative, current members only).
 
@@ -698,45 +754,92 @@ async def _get_reps_raw(zip: str) -> list:
     if not state:
         return results
 
-    if not CONGRESS_KEY:
-        logger.warning("CONGRESS_API_KEY not set — cannot look up representatives")
-        return results
+    if CONGRESS_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await client.get(
+                    "https://api.congress.gov/v3/member",
+                    params={
+                        "stateCode": state, "currentMember": "true",
+                        "limit": "50", "api_key": CONGRESS_KEY, "format": "json",
+                    },
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    for m in data.get("members", []):
+                        terms = m.get("terms", {}).get("item", [])
+                        latest = terms[-1] if terms else {}
+                        ch = latest.get("chamber", "")
+                        chamber = "Senate" if "Senate" in ch else "House"
+                        raw_name = m.get("name", "")
+                        if "," in raw_name:
+                            parts = raw_name.split(",", 1)
+                            raw_name = f"{parts[1].strip()} {parts[0].strip()}"
+                        results.append({
+                            "name": raw_name,
+                            "party": m.get("partyName", ""),
+                            "state": m.get("state", state),
+                            "district": str(m.get("district", "")),
+                            "chamber": chamber,
+                            "phone": "(202) 224-3121",
+                            "office": "",
+                            "website": m.get("officialWebsiteUrl", ""),
+                            "photoUrl": (m.get("depiction") or {}).get("imageUrl", ""),
+                            "bioguide_id": m.get("bioguideId", ""),
+                        })
+        except Exception as e:
+            logger.warning(f"Congress.gov member lookup failed: {_sanitize_error(e)}")
 
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.get(
-                "https://api.congress.gov/v3/member",
-                params={
-                    "stateCode": state, "currentMember": "true",
-                    "limit": "50", "api_key": CONGRESS_KEY, "format": "json",
-                },
-            )
-            if r.status_code == 200:
-                data = r.json()
-                for m in data.get("members", []):
-                    terms = m.get("terms", {}).get("item", [])
-                    latest = terms[-1] if terms else {}
-                    ch = latest.get("chamber", "")
-                    chamber = "Senate" if "Senate" in ch else "House"
-                    # Congress.gov returns names as "Last, First" — normalize
-                    raw_name = m.get("name", "")
-                    if "," in raw_name:
-                        parts = raw_name.split(",", 1)
-                        raw_name = f"{parts[1].strip()} {parts[0].strip()}"
-                    results.append({
-                        "name": raw_name,
-                        "party": m.get("partyName", ""),
-                        "state": m.get("state", state),
-                        "district": str(m.get("district", "")),
-                        "chamber": chamber,
-                        "phone": "(202) 224-3121",
-                        "office": "",
-                        "website": m.get("officialWebsiteUrl", ""),
-                        "photoUrl": (m.get("depiction") or {}).get("imageUrl", ""),
-                        "bioguide_id": m.get("bioguideId", ""),
-                    })
-    except Exception as e:
-        logger.warning(f"Congress.gov member lookup failed: {_sanitize_error(e)}")
+    # FALLBACK: Use static senator data when Congress.gov is down
+    if not results and state:
+        logger.info(f"Using static senator fallback for state {state}")
+        static_sens = STATIC_SENATORS.get(state, [])
+        for s in static_sens:
+            results.append({
+                "name": s["name"],
+                "party": s["party"],
+                "state": s["state"],
+                "district": "",
+                "chamber": "Senate",
+                "phone": "(202) 224-3121",
+                "office": "",
+                "website": "",
+            })
+
+        # Also try House.gov ZIP lookup for House members
+        try:
+            async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+                r = await client.get(
+                    f"https://ziplook.house.gov/htbin/findrep_house?ZIP={zip}"
+                )
+                if r.status_code == 200:
+                    text = r.text
+                    # Parse the HTML response for rep links
+                    # House.gov returns links like <a href="https://lastname.house.gov">First Last</a>
+                    import re as _re
+                    rep_pattern = _re.compile(
+                        r'<a\s+href="(https?://[^"]*\.house\.gov/?)"[^>]*>([^<]+)</a>',
+                        _re.IGNORECASE,
+                    )
+                    seen = set()
+                    for match in rep_pattern.finditer(text):
+                        url = match.group(1)
+                        name = match.group(2).strip()
+                        # Filter out non-member links (e.g. house.gov itself, committees)
+                        if name and len(name) > 3 and url not in seen and "house.gov/representatives" not in url:
+                            seen.add(url)
+                            results.append({
+                                "name": name,
+                                "party": "",  # House.gov doesn't include party in ZIP lookup
+                                "state": state,
+                                "district": "",
+                                "chamber": "House",
+                                "phone": "(202) 225-3121",
+                                "office": "",
+                                "website": url,
+                            })
+        except Exception as e:
+            logger.warning(f"House.gov ZIP lookup failed: {_sanitize_error(e)}")
 
     return results
 
